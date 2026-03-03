@@ -1,131 +1,167 @@
-// Aurora Balance Checker - SillyTavern Extension
-// 查询 love.auroralove.cc 的 API 余额
-
 import { saveSettingsDebounced } from '../../../../script.js';
 import { extension_settings } from '../../../extensions.js';
 
 const extensionName = 'aurora-balance';
-const extensionFolderPath = `scripts/extensions/third-party/${extensionName}`;
 const defaultSettings = {
     apiKey: '',
-    autoRefresh: false,
-    refreshInterval: 60, // 秒
 };
 
-let refreshTimer = null;
-
-/**
- * 加载扩展设置
- */
+// ========== 加载设置 ==========
 function loadSettings() {
-    // 初始化默认设置
     extension_settings[extensionName] = extension_settings[extensionName] || {};
-    if (Object.keys(extension_settings[extensionName]).length === 0) {
-        Object.assign(extension_settings[extensionName], defaultSettings);
+    if (!extension_settings[extensionName].apiKey) {
+        extension_settings[extensionName].apiKey = defaultSettings.apiKey;
     }
-
-    // 确保所有默认字段存在
-    for (const [key, value] of Object.entries(defaultSettings)) {
-        if (extension_settings[extensionName][key] === undefined) {
-            extension_settings[extensionName][key] = value;
-        }
-    }
-
-    // 同步 UI
     $('#aurora_api_key_input').val(extension_settings[extensionName].apiKey);
-    $('#aurora_auto_refresh').prop('checked', extension_settings[extensionName].autoRefresh);
 }
 
-/**
- * 查询余额
- */
+// ========== 查询余额（通过酒馆后端代理，避免 CORS） ==========
 async function checkBalance() {
     const apiKey = extension_settings[extensionName].apiKey;
 
-    if (!apiKey) {
-        showResult('<span class="balance-error">⚠️ 请先填写 API Key</span>');
-        toastr.warning('请先填写 Aurora API Key');
+    if (!apiKey || apiKey.trim() === '') {
+        showResult('<span class="aurora-balance-error">⚠️ 请先填写 API Key！</span>');
+        toastr.warning('请先输入你的 Aurora API Key');
         return;
     }
 
-    showResult('⏳ 查询中...');
+    showResult('⏳ 正在查询余额...');
+    $('#aurora-check-balance-btn').prop('disabled', true);
 
     try {
-        const response = await fetch('https://love.auroralove.cc/api/points', {
-            method: 'GET',
-            headers: {
-                'Authorization': `Bearer ${apiKey}`,
-                'Content-Type': 'application/json',
-                'Accept': '*/*',
-            },
-        });
+        // === 方法1：直接请求（如果没有 CORS 问题） ===
+        let response;
+        let data;
 
-        if (!response.ok) {
-            const errorText = await response.text();
-            throw new Error(`HTTP ${response.status}: ${errorText}`);
+        try {
+            response = await fetch('https://love.auroralove.cc/api/points', {
+                method: 'GET',
+                headers: {
+                    'Authorization': `Bearer ${apiKey.trim()}`,
+                    'Accept': '*/*',
+                },
+            });
+
+            if (!response.ok) {
+                const errText = await response.text();
+                throw new Error(`HTTP ${response.status} - ${errText.substring(0, 200)}`);
+            }
+
+            // 尝试解析为 JSON
+            const contentType = response.headers.get('content-type') || '';
+            const rawText = await response.text();
+
+            // 检查是否返回了 HTML（维护页面）
+            if (rawText.includes('<!DOCTYPE') || rawText.includes('<html')) {
+                throw new Error('服务器返回了 HTML 页面（可能正在维护中）');
+            }
+
+            try {
+                data = JSON.parse(rawText);
+            } catch {
+                // 如果不是 JSON，直接显示原始文本
+                data = rawText;
+            }
+
+        } catch (fetchError) {
+            // === 方法2：如果直接请求失败，尝试通过酒馆代理 ===
+            console.warn('[Aurora] 直接请求失败，尝试通过代理...', fetchError.message);
+
+            try {
+                response = await fetch('/api/extensions/fetch', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        url: 'https://love.auroralove.cc/api/points',
+                        method: 'GET',
+                        headers: {
+                            'Authorization': `Bearer ${apiKey.trim()}`,
+                        },
+                    }),
+                });
+
+                const rawText = await response.text();
+
+                if (rawText.includes('<!DOCTYPE') || rawText.includes('<html')) {
+                    throw new Error('🔧 Aurora 服务器正在维护中，请稍后再试！');
+                }
+
+                try {
+                    data = JSON.parse(rawText);
+                } catch {
+                    data = rawText;
+                }
+
+            } catch (proxyError) {
+                throw new Error(proxyError.message || fetchError.message);
+            }
         }
 
-        const data = await response.json();
-        console.log('[Aurora Balance]', data);
-
-        // 根据 API 返回的数据结构显示余额
-        // 常见的返回格式可能是: { points: 123 } 或 { balance: 123 } 或 { data: { points: 123 } }
-        let balanceText = '';
-
-        if (typeof data === 'number') {
-            balanceText = `<span class="balance-value">${data}</span> 点数`;
-        } else if (data.points !== undefined) {
-            balanceText = `<span class="balance-value">${data.points}</span> 点数`;
-        } else if (data.balance !== undefined) {
-            balanceText = `<span class="balance-value">${data.balance}</span>`;
-        } else if (data.data && data.data.points !== undefined) {
-            balanceText = `<span class="balance-value">${data.data.points}</span> 点数`;
-        } else {
-            // 如果不确定结构，直接显示原始 JSON
-            balanceText = `<pre style="margin:0;white-space:pre-wrap;">${JSON.stringify(data, null, 2)}</pre>`;
-        }
+        // ========== 显示结果 ==========
+        console.log('[Aurora Balance] 返回数据:', data);
 
         const now = new Date().toLocaleTimeString('zh-CN');
-        showResult(`💰 余额: ${balanceText}<br><small style="opacity:0.6;">更新于 ${now}</small>`);
+        let balanceHtml = '';
+
+        if (data === null || data === undefined) {
+            balanceHtml = '<span class="aurora-balance-error">返回数据为空</span>';
+        } else if (typeof data === 'string') {
+            balanceHtml = `<span class="aurora-balance-value">${data}</span>`;
+        } else if (typeof data === 'number') {
+            balanceHtml = `💰 余额: <span class="aurora-balance-value">${data}</span>`;
+        } else if (typeof data === 'object') {
+            // 尝试各种可能的字段名
+            const points = data.points ?? data.point ?? data.balance ?? 
+                           data.credit ?? data.credits ?? data.remaining ??
+                           (data.data && (data.data.points ?? data.data.balance ?? data.data.credit)) ??
+                           null;
+
+            if (points !== null && points !== undefined) {
+                balanceHtml = `💰 余额: <span class="aurora-balance-value">${points}</span> 点数`;
+            } else {
+                // 显示完整 JSON 方便调试
+                balanceHtml = `<pre style="margin:0;white-space:pre-wrap;font-size:12px;">${JSON.stringify(data, null, 2)}</pre>`;
+            }
+        }
+
+        showResult(`
+            ${balanceHtml}
+            <div class="aurora-balance-time">🕐 更新于 ${now}</div>
+        `);
         toastr.success('余额查询成功！');
 
     } catch (error) {
-        console.error('[Aurora Balance] Error:', error);
-        showResult(`<span class="balance-error">❌ 查询失败: ${error.message}</span>`);
-        toastr.error(`查询失败: ${error.message}`);
+        console.error('[Aurora Balance] 查询失败:', error);
+
+        let errorMsg = error.message;
+        if (errorMsg.includes('维护')) {
+            showResult(`<span class="aurora-balance-error">🔧 Aurora 服务器正在维护中</span>
+                <div class="aurora-balance-time">请稍后再试</div>`);
+            toastr.error('Aurora 服务器维护中');
+        } else if (errorMsg.includes('Failed to fetch') || errorMsg.includes('NetworkError')) {
+            showResult(`<span class="aurora-balance-error">🌐 网络错误或 CORS 被阻止</span>
+                <div class="aurora-balance-time">请检查网络连接</div>`);
+            toastr.error('网络连接失败');
+        } else {
+            showResult(`<span class="aurora-balance-error">❌ ${errorMsg}</span>`);
+            toastr.error(`查询失败: ${errorMsg}`);
+        }
+    } finally {
+        $('#aurora-check-balance-btn').prop('disabled', false);
     }
 }
 
-/**
- * 显示结果
- */
+// ========== 显示结果 ==========
 function showResult(html) {
     $('#aurora-balance-result').html(html);
 }
 
-/**
- * 管理自动刷新定时器
- */
-function manageAutoRefresh() {
-    if (refreshTimer) {
-        clearInterval(refreshTimer);
-        refreshTimer = null;
-    }
-
-    if (extension_settings[extensionName].autoRefresh && extension_settings[extensionName].apiKey) {
-        const interval = extension_settings[extensionName].refreshInterval * 1000;
-        refreshTimer = setInterval(checkBalance, interval);
-        console.log(`[Aurora Balance] 自动刷新已启动，间隔 ${extension_settings[extensionName].refreshInterval}s`);
-    }
-}
-
-/**
- * 初始化 - jQuery ready
- */
+// ========== 初始化 ==========
 jQuery(async () => {
-    // 创建 UI 面板 HTML
     const settingsHtml = `
-    <div id="aurora-balance-panel" class="aurora-balance-settings">
+    <div id="aurora-balance-panel">
         <div class="inline-drawer">
             <div class="inline-drawer-toggle inline-drawer-header">
                 <b>🌌 Aurora 余额查询</b>
@@ -134,16 +170,13 @@ jQuery(async () => {
             <div class="inline-drawer-content">
                 <div>
                     <label for="aurora_api_key_input">
-                        <small>Aurora API Key</small>
+                        <small>Aurora API Key：</small>
                     </label>
-                    <input id="aurora_api_key_input" class="text_pole" type="password" 
-                           placeholder="输入你的 Aurora API Key (如: Aurora-H5VFLn...)" />
+                    <input id="aurora_api_key_input" 
+                           class="text_pole" 
+                           type="password" 
+                           placeholder="例如: Aurora-H5VFLnVI7NwqaMyf6LC2Hh" />
                 </div>
-
-                <label id="aurora-auto-refresh-label">
-                    <input id="aurora_auto_refresh" type="checkbox" />
-                    <span>自动刷新 (每60秒)</span>
-                </label>
 
                 <div id="aurora-check-balance-btn" class="menu_button menu_button_icon">
                     <i class="fa-solid fa-coins"></i>
@@ -155,36 +188,25 @@ jQuery(async () => {
                 </div>
             </div>
         </div>
-    </div>
-    `;
+    </div>`;
 
-    // 将面板添加到扩展设置区域
+    // 添加到扩展设置面板
     $('#extensions_settings').append(settingsHtml);
 
-    // 加载设置
+    // 加载已保存的设置
     loadSettings();
 
-    // ===== 事件绑定 =====
-
-    // API Key 输入
+    // 绑定事件
     $('#aurora_api_key_input').on('input', function () {
         extension_settings[extensionName].apiKey = $(this).val().trim();
         saveSettingsDebounced();
-        manageAutoRefresh();
     });
 
-    // 查询按钮点击
-    $('#aurora-check-balance-btn').on('click', checkBalance);
-
-    // 自动刷新开关
-    $('#aurora_auto_refresh').on('change', function () {
-        extension_settings[extensionName].autoRefresh = $(this).prop('checked');
-        saveSettingsDebounced();
-        manageAutoRefresh();
+    $('#aurora-check-balance-btn').on('click', function () {
+        if (!$(this).prop('disabled')) {
+            checkBalance();
+        }
     });
 
-    // 启动自动刷新（如果之前开启了）
-    manageAutoRefresh();
-
-    console.log('[Aurora Balance] 插件已加载 ✅');
+    console.log('[Aurora Balance Checker] ✅ 插件加载完成');
 });
